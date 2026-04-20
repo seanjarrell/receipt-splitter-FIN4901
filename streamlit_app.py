@@ -8,9 +8,9 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 import datetime
- 
+
 st.set_page_config(page_title="ReceiptIQ · FIN4901", page_icon="🧾", layout="wide", initial_sidebar_state="collapsed")
- 
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap');
@@ -79,17 +79,17 @@ hr{border-color:var(--border)!important}
 @media(max-width:768px){.hero{padding:1.4rem}.hero-title{font-size:2rem}.stats{gap:.5rem}.rcpt-header{flex-direction:column;gap:.5rem}}
 </style>
 """, unsafe_allow_html=True)
- 
+
 # ── Session state ─────────────────────────────────────────────
 if "receipts" not in st.session_state:
     st.session_state["receipts"] = []
- 
+
 # ── Model loading ─────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_ocr():
     import easyocr
     return easyocr.Reader(['en'], gpu=False, verbose=False)
- 
+
 @st.cache_resource(show_spinner=False)
 def load_engine():
     try:
@@ -100,7 +100,7 @@ def load_engine():
         return None, "contour fallback"
     except Exception as e:
         return None, f"contour fallback ({e})"
- 
+
 # ── Contour fallback ──────────────────────────────────────────
 def detect_contours(img_pil):
     img=np.array(img_pil); gray=cv2.cvtColor(img,cv2.COLOR_RGB2GRAY)
@@ -116,17 +116,17 @@ def detect_contours(img_pil):
         dup=any(max(0,min(x2,bx2)-max(x1,bx1))*max(0,min(y2,by2)-max(y1,by1))/max((x2-x1)*(y2-y1)+(bx2-bx1)*(by2-by1)-max(0,min(x2,bx2)-max(x1,bx1))*max(0,min(y2,by2)-max(y1,by1)),1)>0.7 for (bx1,by1,bx2,by2) in boxes)
         if not dup: crops.append(img_pil.crop((x1,y1,x2,y2))); boxes.append((x1,y1,x2,y2))
     return crops if crops else [img_pil]
- 
+
 def detect_receipts(img_pil,engine,status):
     if engine is not None:
         crops=engine.detect_and_crop_all(img_pil,return_pil=True)
         if crops: return crops,status
     return detect_contours(img_pil),"contour fallback"
- 
+
 # ── OCR + parsing ─────────────────────────────────────────────
 def run_ocr(img_pil,reader):
     return [(t.strip(),float(c)) for (_,t,c) in reader.readtext(np.array(img_pil)) if c>0.35]
- 
+
 def parse_receipt(lines):
     texts=[t for t,_ in lines]
     store=texts[0].title() if texts else "Unknown Store"
@@ -150,7 +150,7 @@ def parse_receipt(lines):
             name=re.sub(r'\s{2,}',' ',price_re.sub('',line)).strip().strip('$-').strip()
             if name and len(name)>1: items.append({"name":name.title(),"price":amt})
     return {"store_name":store,"date":date or "Unknown","items":items,"subtotal":subtotal,"tax":tax,"total":total,"raw_lines":texts}
- 
+
 # ── Excel export ──────────────────────────────────────────────
 def build_excel(receipts):
     wb=openpyxl.Workbook()
@@ -216,80 +216,135 @@ def build_excel(receipts):
         ws3["A4"].font=Font(color=DIM,name="Courier New",size=9)
     buf=io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
- 
+
+# ── Image resize helper ───────────────────────────────────────
+def resize_if_large(img_pil, max_px=2000):
+    w, h = img_pil.size
+    if max(w, h) <= max_px:
+        return img_pil
+    scale = max_px / max(w, h)
+    return img_pil.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
 # ── Main pipeline ─────────────────────────────────────────────
-def process_image(source,reader,engine,engine_status):
-    source.seek(0)
-    arr=np.frombuffer(source.read(),dtype=np.uint8)
-    img_cv=cv2.imdecode(arr,cv2.IMREAD_COLOR)
-    if img_cv is None:
-        st.error("Could not decode image — please use JPG or PNG."); return []
-    img_pil=Image.fromarray(cv2.cvtColor(img_cv,cv2.COLOR_BGR2RGB))
-    with st.spinner("Detecting receipt regions…"):
-        crops,det_label=detect_receipts(img_pil,engine,engine_status)
-    short_det=det_label.split("·")[0].strip()
-    st.markdown(f"""<div class="stats">
-      <div class="stat"><span class="stat-val">{len(crops)}</span><span class="stat-lbl">Receipts found</span></div>
-      <div class="stat"><span class="stat-val" style="font-size:.9rem;padding-top:.35rem;">{short_det}</span><span class="stat-lbl">Detector</span></div>
-      <div class="stat"><span class="stat-val">{img_pil.width}×{img_pil.height}</span><span class="stat-lbl">Resolution</span></div>
-    </div>""",unsafe_allow_html=True)
-    if engine is not None and "trained" in det_label:
-        with st.expander("🔍 Detection overlay",expanded=False):
-            st.image(engine.annotate(img_pil),use_column_width=True)
-    parsed_list=[]; prog=st.progress(0,text="Starting OCR…")
-    for i,crop in enumerate(crops):
-        prog.progress(i/len(crops),text=f"Reading receipt {i+1} of {len(crops)}…")
-        parsed=parse_receipt(run_ocr(crop,reader))
-        parsed["crop"]=crop
-        parsed["_idx"]=len(st.session_state["receipts"])+len(parsed_list)
-        parsed_list.append(parsed)
-        store=parsed["store_name"]; date=parsed["date"]
-        total=parsed["total"]; items=parsed["items"]
-        tot_html=(f'<div class="rcpt-total">${total:.2f}</div>' if isinstance(total,float) else "")
-        st.markdown(f"""<div class="rcpt-card">
-          <div class="rcpt-header">
-            <div><div class="rcpt-num">Receipt {i+1} of {len(crops)}</div>
-            <div class="rcpt-store">{store}</div>
-            <div class="rcpt-date">📅 &nbsp;{date}</div></div>{tot_html}
-          </div><div class="rcpt-body">""",unsafe_allow_html=True)
-        c1,c2=st.columns([1,2],gap="large")
-        with c1: st.image(crop,use_column_width=True)
-        with c2:
-            if items:
-                rows="".join(f'<tr><td>{it["name"]}</td><td class="pr">${it["price"]:.2f}</td></tr>' for it in items)
-                tot_row=(f'<tr class="tot-row"><td>Total</td><td class="pr">${total:.2f}</td></tr>' if isinstance(total,float) else "")
-                st.markdown(f'<table class="itbl"><thead><tr><th>Item</th><th style="text-align:right">Price</th></tr></thead><tbody>{rows}{tot_row}</tbody></table>',unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="tip">⚠️ No line items detected — try better lighting or move closer.</div>',unsafe_allow_html=True)
-            buf=io.BytesIO(); crop.save(buf,format="JPEG",quality=93)
-            cs=re.sub(r'[^a-zA-Z0-9]','',store); cd=re.sub(r'[^0-9\-]','',date).replace("/","-")
-            st.download_button(label="💾 Save receipt image",data=buf.getvalue(),
-                file_name=f"{cd}_{cs}_{i+1}.jpg",mime="image/jpeg",
-                key=f"img_{i}_{len(st.session_state['receipts'])}")
-        st.markdown("</div></div>",unsafe_allow_html=True)
-        with st.expander(f"Raw OCR text — receipt {i+1}",expanded=False):
-            st.code("\n".join(parsed["raw_lines"]) or "(none)",language=None)
-    prog.progress(1.0,text="✅ Done!")
-    return parsed_list
- 
+def process_image(source, reader, engine, engine_status):
+    try:
+        source.seek(0)
+        arr    = np.frombuffer(source.read(), dtype=np.uint8)
+        img_cv = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img_cv is None:
+            st.error("Could not decode image — please use JPG or PNG.")
+            return []
+        img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+
+        # Downscale large phone photos to prevent memory crashes on Streamlit Cloud
+        img_pil = resize_if_large(img_pil, max_px=2000)
+
+        with st.spinner("Detecting receipt regions…"):
+            crops, det_label = detect_receipts(img_pil, engine, engine_status)
+
+        short_det = det_label.split("·")[0].strip()
+        st.markdown(f'''<div class="stats">
+          <div class="stat"><span class="stat-val">{len(crops)}</span><span class="stat-lbl">Receipts found</span></div>
+          <div class="stat"><span class="stat-val" style="font-size:.9rem;padding-top:.35rem;">{short_det}</span><span class="stat-lbl">Detector</span></div>
+          <div class="stat"><span class="stat-val" style="font-size:.9rem;padding-top:.35rem;">{img_pil.width}×{img_pil.height}</span><span class="stat-lbl">Resolution</span></div>
+        </div>''', unsafe_allow_html=True)
+
+        if engine is not None and "trained" in det_label:
+            with st.expander("🔍 Detection overlay", expanded=False):
+                st.image(engine.annotate(img_pil), use_container_width=True)
+
+        parsed_list = []
+        prog = st.progress(0, text="Starting OCR…")
+
+        for i, crop in enumerate(crops):
+            prog.progress(i / len(crops), text=f"Reading receipt {i+1} of {len(crops)}…")
+            parsed = parse_receipt(run_ocr(crop, reader))
+            parsed["crop"] = crop
+            parsed["_idx"] = len(st.session_state["receipts"]) + len(parsed_list)
+            parsed_list.append(parsed)
+
+            store = parsed["store_name"]
+            date  = parsed["date"]
+            total = parsed["total"]
+            items = parsed["items"]
+            tot_html = (f'<div class="rcpt-total">${total:.2f}</div>' if isinstance(total, float) else "")
+
+            st.markdown(f'''<div class="rcpt-card">
+              <div class="rcpt-header">
+                <div>
+                  <div class="rcpt-num">Receipt {i+1} of {len(crops)}</div>
+                  <div class="rcpt-store">{store}</div>
+                  <div class="rcpt-date">📅 &nbsp;{date}</div>
+                </div>{tot_html}
+              </div><div class="rcpt-body">''', unsafe_allow_html=True)
+
+            c1, c2 = st.columns([1, 2], gap="large")
+            with c1:
+                st.image(crop, use_container_width=True)
+            with c2:
+                if items:
+                    rows = "".join(
+                        f'<tr><td>{it["name"]}</td><td class="pr">${it["price"]:.2f}</td></tr>'
+                        for it in items
+                    )
+                    tot_row = (
+                        f'<tr class="tot-row"><td>Total</td><td class="pr">${total:.2f}</td></tr>'
+                        if isinstance(total, float) else ""
+                    )
+                    st.markdown(
+                        f'<table class="itbl"><thead><tr><th>Item</th><th style="text-align:right">Price</th></tr></thead><tbody>{rows}{tot_row}</tbody></table>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown(
+                        '<div class="tip">⚠️ No line items detected — try better lighting or move closer.</div>',
+                        unsafe_allow_html=True
+                    )
+
+                buf = io.BytesIO()
+                crop.save(buf, format="JPEG", quality=93)
+                cs = re.sub(r'[^a-zA-Z0-9]', '', store)
+                cd = re.sub(r'[^0-9\-]', '', date).replace("/", "-")
+                st.download_button(
+                    label="💾 Save receipt image",
+                    data=buf.getvalue(),
+                    file_name=f"{cd}_{cs}_{i+1}.jpg",
+                    mime="image/jpeg",
+                    key=f"img_{i}_{len(st.session_state['receipts'])}"
+                )
+
+            st.markdown("</div></div>", unsafe_allow_html=True)
+            with st.expander(f"Raw OCR text — receipt {i+1}", expanded=False):
+                st.code("\n".join(parsed["raw_lines"]) or "(none)", language=None)
+
+        prog.progress(1.0, text="✅ Done!")
+        return parsed_list
+
+    except MemoryError:
+        st.error("⚠️ Image is too large to process. Please try a lower-resolution photo.")
+        return []
+    except Exception as e:
+        st.error(f"⚠️ Something went wrong: {e}")
+        return []
+
 # ── Manual edit panel ─────────────────────────────────────────
 def render_edit_panel(all_r):
     st.markdown('<div class="section-hdr">✏️ Review & Correct Data</div>',unsafe_allow_html=True)
     st.markdown('<div class="tip"><strong>Check the extracted data below.</strong> If anything is wrong — store name, date, prices — edit it here before exporting. Changes apply immediately to the Excel report and file names.</div>',unsafe_allow_html=True)
- 
+
     for i, rd in enumerate(all_r):
         with st.expander(f"Receipt {i+1} — {rd['store_name']}  ·  {rd['date']}", expanded=False):
             col_img, col_fields = st.columns([1, 2], gap="large")
- 
+
             with col_img:
                 if "crop" in rd:
-                    st.image(rd["crop"], use_column_width=True)
- 
+                    st.image(rd["crop"], use_container_width=True)
+
             with col_fields:
                 st.markdown("**Store name & date**")
                 new_store = st.text_input("Store name", value=rd["store_name"], key=f"edit_store_{i}")
                 new_date  = st.text_input("Date", value=rd["date"], key=f"edit_date_{i}")
- 
+
                 st.markdown("**Totals**")
                 c1, c2, c3 = st.columns(3)
                 with c1:
@@ -301,7 +356,7 @@ def render_edit_panel(all_r):
                 with c3:
                     tot_val = rd["total"] if isinstance(rd.get("total"), float) else 0.0
                     new_tot = st.number_input("Total", value=tot_val, min_value=0.0, step=0.01, format="%.2f", key=f"edit_tot_{i}")
- 
+
                 st.markdown("**Line items**")
                 new_items = []
                 for j, item in enumerate(rd["items"]):
@@ -311,7 +366,7 @@ def render_edit_panel(all_r):
                     with ic2:
                         new_price = st.number_input("Price", value=item["price"], min_value=0.0, step=0.01, format="%.2f", key=f"edit_item_price_{i}_{j}", label_visibility="collapsed")
                     new_items.append({"name": new_name, "price": new_price})
- 
+
                 # Apply changes back to session state
                 st.session_state["receipts"][i]["store_name"] = new_store
                 st.session_state["receipts"][i]["date"]       = new_date
@@ -319,7 +374,7 @@ def render_edit_panel(all_r):
                 st.session_state["receipts"][i]["tax"]        = new_tax if new_tax > 0 else None
                 st.session_state["receipts"][i]["total"]      = new_tot if new_tot > 0 else None
                 st.session_state["receipts"][i]["items"]      = new_items
- 
+
                 # Updated download button using corrected name/date
                 if "crop" in rd:
                     buf = io.BytesIO()
@@ -333,14 +388,14 @@ def render_edit_panel(all_r):
                         mime="image/jpeg",
                         key=f"edit_dl_{i}"
                     )
- 
+
 # ── Header ────────────────────────────────────────────────────
 st.markdown("""<div class="hero" role="banner">
   <div class="hero-eyebrow">FIN4901 · FinTech Graduate Project</div>
   <div class="hero-title">ReceiptIQ</div>
   <p class="hero-desc">Multi-receipt detection &nbsp;·&nbsp; YOLO26 trained model &nbsp;·&nbsp; EasyOCR extraction &nbsp;·&nbsp; Manual correction &nbsp;·&nbsp; Excel export</p>
 </div>""",unsafe_allow_html=True)
- 
+
 # ── Load models ───────────────────────────────────────────────
 col_ocr,col_yolo=st.columns(2)
 with col_ocr:
@@ -359,7 +414,7 @@ with col_yolo:
 2. Place it in the repo root alongside `streamlit_app.py`
 3. Commit & push — the green badge confirms YOLO26 is active
             """)
- 
+
 # ── Input tabs ────────────────────────────────────────────────
 tab_cam,tab_upload=st.tabs(["📷   Camera","📁   Upload"])
 with tab_cam:
@@ -374,12 +429,12 @@ with tab_upload:
     if up:
         res=process_image(up,reader,engine,engine_status)
         if res: st.session_state["receipts"]+=res
- 
+
 # ── Review, analytics + export ────────────────────────────────
 all_r=st.session_state["receipts"]
 if all_r:
     st.markdown("---")
- 
+
     # Stats
     total_items=sum(len(r["items"]) for r in all_r)
     grand=sum(r["total"] for r in all_r if isinstance(r.get("total"),(int,float)))
@@ -388,12 +443,12 @@ if all_r:
       <div class="stat"><span class="stat-val">{total_items}</span><span class="stat-lbl">Line items</span></div>
       <div class="stat"><span class="stat-val">${grand:.2f}</span><span class="stat-lbl">Grand total</span></div>
     </div>""",unsafe_allow_html=True)
- 
+
     # Manual edit panel
     render_edit_panel(all_r)
- 
+
     st.markdown("---")
- 
+
     # Spend by store
     store_totals={}
     for rd in all_r:
@@ -406,7 +461,7 @@ if all_r:
         for s,a in sorted(store_totals.items(),key=lambda x:-x[1]):
             st.markdown(f'<div class="bar-row"><div class="bar-label" title="{s}">{s}</div><div class="bar-track"><div class="bar-fill" style="width:{a/mx*100:.1f}%"></div></div><div class="bar-value">${a:.2f}</div></div>',unsafe_allow_html=True)
         st.markdown('</div></div>',unsafe_allow_html=True)
- 
+
     # Price comparison
     item_map={}
     for rd in all_r:
@@ -421,7 +476,7 @@ if all_r:
         st.markdown('</div>',unsafe_allow_html=True)
     else:
         st.markdown('<div class="tip">ℹ️ <strong>Price comparison</strong> — scan receipts from multiple stores to compare item prices.</div>',unsafe_allow_html=True)
- 
+
     # Export
     st.markdown('<div class="section-hdr">📥 Export</div>',unsafe_allow_html=True)
     c1,c2=st.columns([3,1])
@@ -433,6 +488,6 @@ if all_r:
     with c2:
         if st.button("🗑 Clear all"):
             st.session_state["receipts"]=[]; st.rerun()
- 
+
 st.markdown("---")
 st.markdown('<div style="display:flex;justify-content:space-between;font-size:.72rem;color:#4e5a78;"><span>ReceiptIQ · FIN4901 FinTech Graduate Project</span><span>YOLO26 · EasyOCR · OpenCV · Streamlit</span></div>',unsafe_allow_html=True)
